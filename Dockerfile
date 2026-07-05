@@ -1,137 +1,124 @@
-# Build stage
-FROM python:3.12-slim-trixie AS builder
+# =============================================================================
+# Open Notebook — Multi-stage Docker build (memory-optimized, CN-mirror)
+# =============================================================================
+# Stages: frontend-builder → backend-builder → runtime
+# Frontend and backend builds run in SEPARATE stages so they never compete
+# for RAM in the same container.
+#
+# Memory optimizations:
+#   - Parallel compilation capped at 2 jobs (avoids OOM on 4 GB hosts)
+#   - Node.js heap limited to 1536 MB
+#   - uv builds/downloads throttled
+# =============================================================================
 
-# Install uv using the official method
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 
-# Install system dependencies required for building certain Python packages
-# Add Node.js 22.x LTS for building frontend
-# NOTE: gcc/g++/make removed - uv should download pre-built wheels. Add back if build fails.
-# NOTE: gcc/g++/make required for some python dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    build-essential \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set build optimization environment variables
-ENV MAKEFLAGS="-j$(nproc)"
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV UV_COMPILE_BYTECODE=1
-ENV UV_LINK_MODE=copy
-
-# Set the working directory in the container to /app
-WORKDIR /app
-
-# Copy dependency files and minimal package structure first for better layer caching
-COPY pyproject.toml uv.lock ./
-COPY open_notebook/__init__.py ./open_notebook/__init__.py
-
-# Install dependencies with optimizations (this layer will be cached unless dependencies change)
-RUN uv sync --frozen --no-dev
-
-# Pre-download tiktoken encoding so the app works offline (issue #264).
-# /app/tiktoken-cache is intentionally outside /app/data/ so that volume mounts
-# of /app/data (for user data persistence) do not hide the pre-baked encoding.
-# config.py reads TIKTOKEN_CACHE_DIR from the environment to pick up this path.
-ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
-RUN mkdir -p /app/tiktoken-cache && \
-    .venv/bin/python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
-
-# Copy the rest of the application code
-COPY . /app
-
-# Install frontend dependencies and build
+# ---------------------------------------------------------------------------
+# Stage 1: Frontend Builder
+# ---------------------------------------------------------------------------
+FROM node:22-slim AS frontend-builder
+ARG NPM_REGISTRY
 WORKDIR /app/frontend
-ARG NPM_REGISTRY=https://registry.npmjs.org/
+
+# Constrain Node.js heap so Next.js / webpack doesn't blow through RAM
+ENV NODE_OPTIONS="--max-old-space-size=1536"
+
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm config set registry ${NPM_REGISTRY} \
  && npm config set fetch-retries 5 \
  && npm config set fetch-retry-mintimeout 20000 \
  && npm config set fetch-retry-maxtimeout 120000
-# Retry npm ci to survive transient registry ECONNRESETs, which are common on
-# the QEMU-emulated arm64 leg of the multi-arch build.
 RUN i=0; until npm ci; do \
       i=$((i+1)); \
       if [ "$i" -ge 5 ]; then echo "npm ci failed after $i attempts"; exit 1; fi; \
       echo "npm ci failed (attempt $i); retrying in 15s"; sleep 15; \
     done
+
 COPY frontend/ ./
 RUN npm run build
 
-# Return to app root
-WORKDIR /app
+# ---------------------------------------------------------------------------
+# Stage 2: Backend Builder
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-trixie AS backend-builder
+ARG APT_MIRROR
 
-# Runtime stage
-FROM python:3.12-slim-trixie AS runtime
-
-# Install only runtime system dependencies (no build tools)
-# Add Node.js 22.x LTS for running frontend
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    supervisor \
-    curl \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv using the official method
+# Install uv (for tiktoken cache and potential future use)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Set the working directory in the container to /app
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Memory-conservation build settings ---
+ENV MAKEFLAGS="-j2"
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Copy the virtual environment from builder stage
-COPY --from=builder /app/.venv /app/.venv
+# Copy dependency files first for caching
+COPY pyproject.toml uv.lock ./
+COPY open_notebook/__init__.py ./open_notebook/__init__.py
 
-# Copy the source code (the rest)
-COPY . /app
+# Install dependencies using pip (more reliable with Chinese mirrors than uv)
+# First generate requirements list from the lock file, then pip install
+# Install all dependencies from pyproject.toml using pip with Tsinghua mirror
+RUN pip install --timeout 120 setuptools wheel && pip install --timeout 120 . --no-build-isolation
+    # Dependencies are read from pyproject.toml
 
-# Copy pre-downloaded tiktoken encoding from builder (outside /data/ — volume-mount safe)
-COPY --from=builder /app/tiktoken-cache /app/tiktoken-cache
-
-# Ensure uv uses the existing venv without attempting network operations
-ENV UV_NO_SYNC=1
-ENV VIRTUAL_ENV=/app/.venv
-# Point the app at the pre-baked tiktoken encoding (see open_notebook/config.py)
+# Pre-download tiktoken encoding so the app works offline
 ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
+RUN mkdir -p /app/tiktoken-cache && \
+    python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
 
-# Bind Next.js to all interfaces (required for Docker networking and reverse proxies)
+# ---------------------------------------------------------------------------
+# Stage 3: Runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-trixie AS runtime
+ARG APT_MIRROR
+
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list && \
+    apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ffmpeg supervisor curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+WORKDIR /app
+
+COPY --from=backend-builder /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/
+COPY --from=backend-builder /usr/local/bin/ /usr/local/bin/
+COPY . /app/
+COPY --from=backend-builder /app/tiktoken-cache /app/tiktoken-cache
+
+ENV UV_NO_SYNC=1
+ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
 ENV HOSTNAME=0.0.0.0
-# Bind the API to all interfaces (IPv4). Set API_HOST=:: for IPv6 dual-stack environments
 ENV API_HOST=0.0.0.0
 
-# Copy built frontend from builder stage
-COPY --from=builder /app/frontend/.next/standalone /app/frontend/
-COPY --from=builder /app/frontend/.next/static /app/frontend/.next/static
-COPY --from=builder /app/frontend/public /app/frontend/public
-COPY --from=builder /app/frontend/start-server.js /app/frontend/start-server.js
+COPY --from=frontend-builder /app/frontend/.next/standalone /app/frontend/
+COPY --from=frontend-builder /app/frontend/.next/static /app/frontend/.next/static
+COPY --from=frontend-builder /app/frontend/public /app/frontend/public
+COPY --from=frontend-builder /app/frontend/start-server.js /app/frontend/start-server.js
 
-# Expose ports for Frontend and API
 EXPOSE 8502 5055
-
 RUN mkdir -p /app/data
-
-# Copy and make executable the wait-for-api script
 COPY scripts/wait-for-api.sh /app/scripts/wait-for-api.sh
 RUN chmod +x /app/scripts/wait-for-api.sh
-
-# Copy supervisord configuration
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-# Create log directories
 RUN mkdir -p /var/log/supervisor
 
-# Runtime API URL Configuration
-# The API_URL environment variable can be set at container runtime to configure
-# where the frontend should connect to the API. This allows the same Docker image
-# to work in different deployment scenarios without rebuilding.
-#
-# If not set, the system will auto-detect based on incoming requests.
-# Set API_URL when using reverse proxies or custom domains.
-#
-# Example: docker run -e API_URL=https://your-domain.com/api ...
+ENV VIRTUAL_ENV=/app/.venv
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

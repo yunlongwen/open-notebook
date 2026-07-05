@@ -50,3 +50,8 @@ docs
 *.swo
 *~
 .DS_Store
+# ★ 大型非必要文件（减少 build context，间接省内存）
+screenshot-*.png
+logo.png
+docs/assets/
+open_notebook/ai/assets/test_speech.mp3

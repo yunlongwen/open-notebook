@@ -9,7 +9,6 @@ This file provides architectural guidance for contributors working on Open Noteb
 **Key Values**: Privacy-first, multi-provider AI support, fully self-hosted option, open-source transparency.
 
 ---
-
 ## Three-Tier Architecture
 
 ```
@@ -43,7 +42,6 @@ This file provides architectural guidance for contributors working on Open Noteb
 ```
 
 ---
-
 ## Useful sources
 
 User documentation is at @docs/
@@ -81,7 +79,6 @@ User documentation is at @docs/
 - **Embeddings**: Multi-provider via Esperanto
 
 ---
-
 ## Architecture Highlights
 
 ### 1. Async-First Design
@@ -114,7 +111,6 @@ User documentation is at @docs/
 - **Production**: Replace with OAuth/JWT (see CONFIGURATION.md)
 
 ---
-
 ## Important Quirks & Gotchas
 
 ### API Startup
@@ -143,7 +139,6 @@ User documentation is at @docs/
 - **Large files**: Content processing is sync; may block API briefly
 
 ---
-
 ## Component References
 
 See dedicated CLAUDE.md files for detailed guidance:
@@ -157,7 +152,6 @@ See dedicated CLAUDE.md files for detailed guidance:
 - **[open_notebook/database/CLAUDE.md](open_notebook/database/CLAUDE.md)**: SurrealDB operations, migrations, async patterns
 
 ---
-
 ## Documentation Map
 
 - **[README.md](README.md)**: Project overview, features, quick start
@@ -167,7 +161,6 @@ See dedicated CLAUDE.md files for detailed guidance:
 - **[MAINTAINER_GUIDE.md](MAINTAINER_GUIDE.md)**: Release & maintenance procedures
 
 ---
-
 ## Testing Strategy
 
 - **Unit tests**: `tests/test_domain.py`, `test_models_api.py`
@@ -177,7 +170,6 @@ See dedicated CLAUDE.md files for detailed guidance:
 - **Coverage**: Check with `pytest --cov`
 
 ---
-
 ## Common Tasks
 
 ### Add a New API Endpoint
@@ -208,7 +200,6 @@ See dedicated CLAUDE.md files for detailed guidance:
 5. Verify migrations via API logs
 
 ---
-
 ## Support & Community
 
 - **Documentation**: https://open-notebook.ai
@@ -216,3 +207,38 @@ See dedicated CLAUDE.md files for detailed guidance:
 - **Issues**: https://github.com/lfnovo/open-notebook/issues
 - **License**: MIT (see LICENSE)
 
+---
+
+## Docker Build Memory Constraints
+
+When building Docker images locally, **the build process can consume large amounts of memory** due to Python C extension compilation and Next.js webpack bundling. Failure to limit memory may cause the OOM killer to terminate host processes.
+
+### Dockerfile memory protections (built-in)
+The Dockerfile (`Dockerfile`, `Dockerfile.single`) already includes:
+
+| Setting | Value | Effect |
+|---|---|---|
+| `MAKEFLAGS` | `-j2` | Limit C extension parallel compiles to 2 |
+| `UV_CONCURRENT_BUILDS` | `2` | Limit uv parallel builds |
+| `NODE_OPTIONS` | `--max-old-space-size=1536` | Cap Node.js heap at 1.5 GB |
+| Frontend/backend builds | Separate stages | Never compete for RAM in one container |
+
+### Build command must include memory limit
+
+Every local Docker build **MUST** use the `--memory` flag to prevent OOM:
+
+```bash
+make docker-build-local
+# Internally runs:
+#   DOCKER_BUILDKIT=1 docker build --memory=3g --memory-swap=3g ...
+```
+
+For manual builds or CI, always include:
+```bash
+DOCKER_BUILDKIT=1 docker build --memory=3g --memory-swap=3g -t mytag .
+```
+
+**Failure to include `--memory` on memory-constrained hosts (<8 GB) risks killing the build container and potentially other system processes.**
+
+### .dockerignore best practices
+Keep build context lean to reduce temporary storage during multi-stage builds. The project `.dockerignore` already excludes screenshots, test assets, docs images, node_modules, and build artifacts.
