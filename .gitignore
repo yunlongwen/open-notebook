@@ -142,3 +142,5 @@ specs/
 .harness/
 
 .mcp.json
+# 允许备份数据目录
+!my_data/**
