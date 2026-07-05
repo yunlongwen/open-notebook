@@ -26,6 +26,7 @@ services:
       # This encrypts your API keys in the database
       - OPEN_NOTEBOOK_ENCRYPTION_KEY=change-me-to-a-secret-string
       - API_URL=https://notebook.agently.top
+      - OPEN_NOTEBOOK_PASSWORD=70f8b522552862d32d73c88557316cb5
 
       # Database connection. SURREAL_USER / SURREAL_PASSWORD default to root:root
       # for local use; override them in a .env file before exposing the instance
